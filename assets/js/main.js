@@ -6,6 +6,7 @@ let lossTestInterval;      // 用于丢包率测试的定时器 ID
 let totalPackets = 0;      // 丢包测试中发送的总请求数
 let lostPackets = 0;       // 丢包测试中失败的请求数
 let dataPointCount = 0;    // 数据点计数器，用于生成 x 轴标签（1, 2, 3...）
+let testsRunning = false;  // 测试运行锁，防止重复触发导致新旧测试互相污染
 
 // === 初始化图表函数 ===
 function initChart() {
@@ -52,7 +53,7 @@ function initChart() {
       },
       plugins: {
         legend: {
-          display: false // 显示图例
+          display: false // 隐藏图例
         },
         tooltip: {
           enabled: true // 显示提示框
@@ -168,36 +169,52 @@ function testLatency() {
 }
 
 // === 丢包率测试函数（前端模拟） ===
+// 返回 Promise：全部 20 个请求都返回（settled）后才 resolve，保证丢包率统计完整
 function startLossTest() {
-  // 重置计数器
-  totalPackets = 0;
-  lostPackets = 0;
-  document.getElementById('packetLoss').textContent = '--';
+  return new Promise((resolve) => {
+    // 重置计数器
+    totalPackets = 0;
+    lostPackets = 0;
+    let completedPackets = 0; // 已返回（settled）的请求数
+    document.getElementById('packetLoss').textContent = '--';
 
-  // 设置定时器，每 100ms 发送一次请求
-  lossTestInterval = setInterval(() => {
-    totalPackets++; // 总请求数加 1
+    // 设置定时器，每 100ms 发送一次请求
+    lossTestInterval = setInterval(() => {
+      totalPackets++; // 总请求数加 1
 
-    // 发送请求到 /ping 接口
-    fetch('/ping')
-      .then(res => {
-        // 如果响应状态不是 200，则视为丢包
-        if (!res.ok) {
+      // 发送请求到 /ping 接口（2 秒超时，避免个别请求挂起导致测试无法结束）
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      fetch('/ping', { signal: controller.signal })
+        .then(res => {
+          // 如果响应状态不是 200，则视为丢包
+          if (!res.ok) {
+            lostPackets++;
+          }
+        })
+        .catch(() => {
+          // 请求失败（如网络中断）也视为丢包
           lostPackets++;
-        }
-      })
-      .catch(() => {
-        // 请求失败（如网络中断）也视为丢包
-        lostPackets++;
-      });
+        })
+        .finally(() => {
+          clearTimeout(timeoutId);
+          completedPackets++;
 
-    // 发送 20 次请求后停止测试并计算丢包率
-    if (totalPackets >= 20) {
-      clearInterval(lossTestInterval);
-      const lossRate = (lostPackets / totalPackets * 100).toFixed(1);
-      document.getElementById('packetLoss').textContent = lossRate + '%';
-    }
-  }, 100); // 每 100ms 发送一次请求
+          // 全部请求都发出且全部返回后，才计算丢包率
+          if (totalPackets >= 20 && completedPackets >= 20) {
+            clearInterval(lossTestInterval);
+            const lossRate = (lostPackets / totalPackets * 100).toFixed(1);
+            document.getElementById('packetLoss').textContent = lossRate + '%';
+            resolve();
+          }
+        });
+
+      // 发满 20 个请求后停止发送
+      if (totalPackets >= 20) {
+        clearInterval(lossTestInterval);
+      }
+    }, 100); // 每 100ms 发送一次请求
+  });
 }
 
 // === 页面加载完成后初始化 ===
@@ -208,6 +225,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // === 一个按钮触发三项测试 ===
 function startAllTests() {
+  // 防止重复触发：上一轮测试未结束时忽略本次点击
+  if (testsRunning) {
+    return;
+  }
+  testsRunning = true;
+
   // 重置所有状态
   document.getElementById('currentSpeed').textContent = '--';
   document.getElementById('latency').textContent = '--';
@@ -217,8 +240,11 @@ function startAllTests() {
     clearInterval(lossTestInterval);
   }
 
-  // 并行执行三个测试
-  startSpeedTest();
+  // 并行执行三个测试，速度测试和丢包测试都结束后才释放运行锁
   testLatency();
-  startLossTest();
+  Promise.all([startSpeedTest(), startLossTest()])
+    .catch(err => console.error('测试执行出错:', err))
+    .finally(() => {
+      testsRunning = false;
+    });
 }

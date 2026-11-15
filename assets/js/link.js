@@ -92,11 +92,12 @@ async function loadDashboardIcon(baseUrl, name) {
     // console.log(`[IconLoader] Starting icon search for: ${name} (${baseUrl})`);
 
     // 为整个探测过程设置一个总体超时 (例如 8 秒)
+    let overallTimeoutId;
     const overallTimeoutPromise = new Promise(resolve => {
-        setTimeout(() => {
+        overallTimeoutId = setTimeout(() => {
             console.log(`[IconLoader] Overall timeout for ${name}`);
             resolve(createDashboardFallbackIcon(name));
-        }, 5000); 
+        }, 5000);
     });
 
     // 创建一个 Promise 来执行实际的探测逻辑
@@ -130,13 +131,46 @@ async function loadDashboardIcon(baseUrl, name) {
         return createDashboardFallbackIcon(name);
     })();
 
-    // 使用 Promise.race 确保不会超过总体超时
-    return Promise.race([probePromise, overallTimeoutPromise]);
+    // 使用 Promise.race 确保不会超过总体超时，结束后清理超时定时器
+    const result = await Promise.race([probePromise, overallTimeoutPromise]);
+    clearTimeout(overallTimeoutId);
+    return result;
 }
 
-// --- 加载 links.txt 并渲染链接 (保持不变)---
+/**
+ * 检测网站是否可达（前端可达性探测）
+ * 使用 fetch 的 no-cors 模式：只要请求在网络层成功发出并收到响应就 resolve，
+ * 若 DNS 解析失败、连接拒绝或超时则 reject，据此判断站点是否可访问。
+ * 注意：浏览器无法读取响应内容（opaque），因此只能判断"连得上"，无法判断业务状态。
+ * @param {string} url - 目标网站 URL
+ * @param {number} timeoutMs - 超时时间（毫秒）
+ * @returns {Promise<boolean>}
+ */
+function isSiteReachable(url, timeoutMs = 3000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    // 加时间戳参数避免命中浏览器缓存，确保探测的是当前可达性
+    // 使用 URL 对象拼接参数，避免 URL 含锚点(#)时字符串拼接出错
+    let probeUrl = url;
+    try {
+        const urlObj = new URL(url);
+        urlObj.searchParams.set('_probe', Date.now());
+        probeUrl = urlObj.href;
+    } catch (e) {
+        // URL 无效时退回原字符串，交给后续 fetch 失败处理
+    }
 
-// 加载 links.txt 并渲染链接
+    return fetch(probeUrl, {
+        mode: 'no-cors',
+        cache: 'no-store',
+        signal: controller.signal
+    })
+        .then(() => true)
+        .catch(() => false)
+        .finally(() => clearTimeout(timeoutId));
+}
+
+// 加载 links.txt 并渲染链接（并行探测可达性与图标，仅显示可访问的网站）
 async function loadDashboardLinks() {
     const container = document.getElementById('dashboard-links-container');
     container.innerHTML = '<p>正在加载常用网站目录...</p>'; // 显示加载状态
@@ -151,6 +185,7 @@ async function loadDashboardLinks() {
         container.innerHTML = ''; // 清空加载状态
 
         const lines = text.trim().split('\n');
+        const entries = [];
         for (const line of lines) {
             if (!line || line.startsWith('#')) continue;
             const parts = line.trim().split(/\s+/);
@@ -159,41 +194,54 @@ async function loadDashboardLinks() {
             const name = parts[0];
             // 将剩余部分重新组合为URL，以支持包含空格的URL（虽然不常见）
             const url = parts.slice(1).join(' ');
+            entries.push({ name, url });
+        }
 
+        // 并行探测所有网站的可达性
+        const reachableResults = await Promise.all(
+            entries.map(entry => isSiteReachable(entry.url))
+        );
+
+        // 只保留可达的网站
+        const reachableEntries = entries.filter((_, i) => reachableResults[i]);
+
+        if (reachableEntries.length === 0) {
+            container.innerHTML = '<p>当前无可访问的服务。</p>';
+            return;
+        }
+
+        // 并行加载所有可达网站的图标，然后一次性渲染
+        const iconResults = await Promise.all(
+            reachableEntries.map(async entry => {
+                try {
+                    return await loadDashboardIcon(entry.url, entry.name);
+                } catch (iconError) {
+                    console.error(`[Renderer] Error loading icon for ${entry.name} (${entry.url}):`, iconError);
+                    return createDashboardFallbackIcon(entry.name);
+                }
+            })
+        );
+
+        reachableEntries.forEach((entry, i) => {
             const a = document.createElement('a');
-            a.href = url;
+            a.href = entry.url;
             a.target = '_blank';
             a.className = 'dashboard-link-item';
 
             const img = document.createElement('img');
             img.className = 'dashboard-link-icon';
-            img.alt = `${name} icon`;
+            img.alt = `${entry.name} icon`;
             img.loading = 'lazy'; // 启用懒加载
-            // 异步加载图标
-            try {
-                 // 使用新的、使用 <img> 检测的函数
-                const iconSrc = await loadDashboardIcon(url, name);
-                img.src = iconSrc;
-                // console.log(`[Renderer] Icon set for ${name}:`, iconSrc);
-            } catch (iconError) {
-                console.error(`[Renderer] Error setting icon for ${name} (${url}):`, iconError);
-                // 即使异步加载出错，也使用 fallback
-                img.src = createDashboardFallbackIcon(name);
-            }
-
+            img.src = iconResults[i];
 
             const span = document.createElement('span');
-            span.textContent = name;
+            span.textContent = entry.name;
             span.className = 'dashboard-link-text';
 
             a.appendChild(img);
             a.appendChild(span);
             container.appendChild(a);
-        }
-
-        if (container.children.length === 0) {
-            container.innerHTML = '<p>links.txt 中未找到有效服务。</p>';
-        }
+        });
     } catch (err) {
         console.error('加载 links.txt 失败:', err);
         container.innerHTML = `<p style="color:red;">加载内网服务列表失败: ${err.message}</p>`;
